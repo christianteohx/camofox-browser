@@ -500,3 +500,151 @@ Key patterns:
 - **Metrics**: `ctx.failuresTotal.labels(...)` for core counters, `ctx.createMetric()` for custom
 - **Scanner compliance**: `child_process` in `youtube.js`, route handler in `index.js` — separate files
 - **System deps**: `apt.txt` lists packages installed via `scripts/install-plugin-deps.sh`
+
+---
+
+## Self-Healing Helpers
+
+Helpers allow agents to extend camofox-browser with custom functionality at runtime. Unlike plugins (which are loaded at server start and require a restart to change), helpers live in a directory and can be added/edited without restarting the server.
+
+### Directory Configuration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CAMOFOX_HELPERS_DIR` | `~/.camofox/helpers/` or `./helpers/` | Explicit helper directory |
+
+If `CAMOFOX_HELPERS_DIR` is not set, camofox looks in:
+1. `~/.camofox/helpers/` (user-level)
+2. `./helpers/` (project-level)
+
+The first directory that exists is used. Set `CAMOFOX_HELPERS_DIR` to override.
+
+### Helper File Structure
+
+Each helper is a `.js` file that exports:
+
+```js
+// helpers/my_helper.js
+
+export const name = 'my_helper';           // Required for discovery
+export const description = 'What this does'; // Shown to agents
+
+export async function register(app, ctx) {
+  // app  = Express app (add routes here)
+  // ctx  = Plugin context (same as plugins)
+  
+  app.post('/helpers/my_helper', async (req, res) => {
+    const { userId, tabId, ... } = req.body;
+    // ... implementation
+    ctx.events.emit('helper:my_helper', { userId, tabId });
+    res.json({ ok: true });
+  });
+}
+```
+
+### Plugin Context (available in helpers)
+
+Helpers receive the same `ctx` object as plugins:
+
+| Property | Description |
+|----------|-------------|
+| `getSession(userId)` | Get or create a session |
+| `normalizeUserId(id)` | Coerce to string |
+| `validateUrl(url)` | Validate URL (returns error or null) |
+| `safeError(err)` | Sanitize error for client |
+| `events` | EventEmitter (29 events) |
+| `log` | Structured logging |
+
+### Graceful Error Handling
+
+Helpers are self-healing:
+- **Syntax errors** → Helper skipped, server continues
+- **Missing exports** → Helper skipped, logged as warning
+- **Runtime errors during registration** → Skipped, other helpers unaffected
+- **Bad helper doesn't crash the server**
+
+### Example: File Upload Helper
+
+```js
+// ~/.camofox/helpers/upload_file.js
+
+export const name = 'upload_file';
+export const description = 'Upload a local file to a web page element.';
+
+export async function register(app, ctx) {
+  app.post('/helpers/upload_file', async (req, res) => {
+    const { userId, tabId, ref, filePath } = req.body;
+    if (!userId || !tabId || !filePath) {
+      return res.status(400).json({ error: 'userId, tabId, filePath required' });
+    }
+
+    const session = await ctx.getSession(userId);
+    let foundTab = null;
+    for (const group of session.tabGroups.values()) {
+      if (group.has(tabId)) { foundTab = group.get(tabId); break; }
+    }
+    if (!foundTab) return res.status(404).json({ error: 'Tab not found' });
+
+    const { page, refs } = foundTab;
+    let locator = null;
+    if (ref && refs) {
+      const info = refs.get(ref);
+      if (info) {
+        locator = page.getByRole(info.role, info.name ? { name: info.name } : undefined).nth(info.nth);
+      }
+    }
+    if (!locator && ref) locator = page.locator(ref);
+    if (!locator) return res.status(400).json({ error: `Cannot resolve: ${ref}` });
+
+    await locator.setInputFiles(filePath, { timeout: 10000 });
+    ctx.events.emit('helper:upload_file', { userId, tabId, filePath });
+    res.json({ ok: true, filePath });
+  });
+}
+```
+
+### Example: Table Scraper Helper
+
+```js
+// ~/.camofox/helpers/scrape_table.js
+
+export const name = 'scrape_table';
+export const description = 'Extract HTML table data as JSON.';
+
+export async function register(app, ctx) {
+  app.post('/helpers/scrape_table', async (req, res) => {
+    const { userId, tabId, selector } = req.body;
+    if (!userId || !tabId) {
+      return res.status(400).json({ error: 'userId and tabId required' });
+    }
+
+    const session = await ctx.getSession(userId);
+    let foundTab = null;
+    for (const group of session.tabGroups.values()) {
+      if (group.has(tabId)) { foundTab = group.get(tabId); break; }
+    }
+    if (!foundTab) return res.status(404).json({ error: 'Tab not found' });
+
+    const tableData = await foundTab.page.evaluate((sel) => {
+      const table = sel ? document.querySelector(sel) : document.querySelector('table');
+      if (!table) return null;
+      const headers = Array.from(table.querySelectorAll('th')).map(th => th.textContent.trim());
+      const rows = Array.from(table.querySelectorAll('tr')).slice(headers.length ? 1 : 0)
+        .map(tr => Array.from(tr.querySelectorAll('td')).map(td => td.textContent.trim()));
+      return { headers, rows };
+    }, selector || null);
+
+    if (!tableData) return res.status(404).json({ error: 'No table found' });
+
+    ctx.events.emit('helper:scrape_table', { userId, tabId, rowCount: tableData.rows.length });
+    res.json({ ok: true, ...tableData });
+  });
+}
+```
+
+### Scanner Rules for Helpers
+
+Helpers follow the same isolation rules as plugins:
+- **No `process.env`** — use `ctx.config` instead
+- **No `child_process`** in route handler files
+- Route handlers in helper files are fine (same as plugin `index.js`)

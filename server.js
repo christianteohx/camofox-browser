@@ -9,6 +9,7 @@ import { loadConfig } from './lib/config.js';
 import { normalizePlaywrightProxy, createProxyPool, buildProxyUrl } from './lib/proxy.js';
 import { createFlyHelpers } from './lib/fly.js';
 import { createPluginEvents, loadPlugins } from './lib/plugins.js';
+import { loadHelpers, registerHelpers } from './lib/helpers.js';
 import { requireAuth, timingSafeCompare as _timingSafeCompare, isLoopbackAddress as _isLoopbackAddress } from './lib/auth.js';
 import { windowSnapshot } from './lib/snapshot.js';
 import {
@@ -3190,6 +3191,23 @@ const pluginCtx = {
   VirtualDisplay,
 };
 const loadedPlugins = await loadPlugins(app, pluginCtx);
+
+// Load self-healing helpers (agents can write custom helpers at runtime)
+const helpersDirs = CONFIG.helpersDir
+  ? [CONFIG.helpersDir]
+  : CONFIG.defaultHelpersDirs;
+
+let allHelpers = [];
+for (const dir of helpersDirs) {
+  const helpers = await loadHelpers(dir, log);
+  allHelpers.push(...helpers);
+}
+if (allHelpers.length > 0) {
+  const registeredHelpers = await registerHelpers(allHelpers, app, pluginCtx);
+  log('info', 'helpers registered', { count: registeredHelpers.length, helpers: registeredHelpers.map(h => h.name) });
+} else {
+  log('info', 'helpers: none loaded (set CAMOFOX_HELPERS_DIR to enable)');
+}
 
 const server = app.listen(PORT, async () => {
   startMemoryReporter();
