@@ -425,6 +425,11 @@ if (proxyPool) {
 }
 
 const BROWSER_IDLE_TIMEOUT_MS = CONFIG.browserIdleTimeoutMs;
+
+// Server start time for /health uptime calculation
+const SERVER_START_TIME = Date.now();
+
+
 let browserIdleTimer = null;
 let browserLaunchPromise = null;
 let browserWarmRetryTimer = null;
@@ -1510,30 +1515,52 @@ async function refreshTabRefs(tabState, options = {}) {
 }
 
 
-app.get('/health', (req, res) => {
+app.get('/health', async (req, res) => {
+  // Passive recovery check first — don't probe if we're mid-restart
   if (healthState.isRecovering) {
     return res.status(503).json({ ok: false, engine: 'camoufox', recovering: true });
   }
-  const running = browser !== null && (browser.isConnected?.() ?? false);
-  if (proxyPool?.canRotateSessions && !running) {
-    scheduleBrowserWarmRetry();
+
+  // --- Active browser liveness check ---
+  let browserAlive = false;
+  let browserError = null;
+
+  if (browser !== null && (browser.isConnected?.() ?? false)) {
+    try {
+      // Quick probe: create + immediately close a throwaway context
+      const probeCtx = await browser.newContext();
+      await probeCtx.close();
+      browserAlive = true;
+    } catch (probeErr) {
+      browserError = probeErr.message;
+    }
+  } else {
+    browserError = 'browser not connected';
+  }
+
+  // --- Dead browser: trigger restart and report as unhealthy ---
+  if (!browserAlive) {
+    // Emit restart asynchronously — don't await so /health returns fast
+    restartBrowser('health check dead').catch(err => {
+      log('error', 'background browser restart failed after health check', { error: err.message });
+    });
     return res.status(503).json({
       ok: false,
-      engine: 'camoufox',
-      browserConnected: false,
-      browserRunning: false,
-      warming: true,
+      browserAlive: false,
+      error: browserError || 'browser is dead or crashed',
+      tabCount: getTotalTabCount(),
+      uptime: Math.floor((Date.now() - SERVER_START_TIME) / 1000),
+      transitioning: true,
       ...(FLY_MACHINE_ID ? { machineId: FLY_MACHINE_ID } : {}),
     });
   }
-  res.json({ 
-    ok: true, 
-    engine: 'camoufox',
-    browserConnected: running,
-    browserRunning: running,
-    activeTabs: getTotalTabCount(),
-    activeSessions: sessions.size,
-    consecutiveFailures: healthState.consecutiveNavFailures,
+
+  // --- Healthy ---
+  res.json({
+    ok: true,
+    browserAlive: true,
+    tabCount: getTotalTabCount(),
+    uptime: Math.floor((Date.now() - SERVER_START_TIME) / 1000),
     ...(FLY_MACHINE_ID ? { machineId: FLY_MACHINE_ID } : {}),
   });
 });
