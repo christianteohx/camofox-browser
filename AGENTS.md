@@ -648,3 +648,13 @@ Helpers follow the same isolation rules as plugins:
 - **No `process.env`** — use `ctx.config` instead
 - **No `child_process`** in route handler files
 - Route handlers in helper files are fine (same as plugin `index.js`)
+
+
+## Troubleshooting
+
+###  fails to load (NODE_MODULE_VERSION mismatch)
+If camoufox fails to launch with an error like "module was compiled against a different Node.js version", rebuild better-sqlite3 from source:
+```bash
+cd node_modules/better-sqlite3 && npm run build-release
+```
+Then restart the server.
